@@ -1,109 +1,232 @@
 import streamlit as st
 import os
-import google.generativeai as genai
+import io
+import time
+import requests
 from dotenv import load_dotenv
-from pypdf import PdfReader # Librăria nouă pentru PDF-uri
+from pypdf import PdfReader
+import google.generativeai as genai
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
+from streamlit_lottie import st_lottie
+from duckduckgo_search import DDGS
 
-# 1. Configurare
+# --- 1. CONFIGURATION ---
 load_dotenv()
 api_key = os.getenv("GEMINI_API_KEY")
 
 if not api_key:
-    st.error("⚠️ Cheia API lipsește!")
+    st.error("⚠️ API Key missing!")
     st.stop()
 
 genai.configure(api_key=api_key)
 
-# Folosim modelul Flash simplu, fără tools momentan (pentru stabilitate maximă)
-# Gemini 2.5 are context uriaș, deci putem încărca PDF-uri mari direct în el.
-try:
-    model = genai.GenerativeModel('models/gemini-2.5-flash')
-except:
-    model = genai.GenerativeModel('gemini-1.5-flash')
+SERVICE_ACCOUNT_FILE = 'service_account.json' 
+SCOPES = ['https://www.googleapis.com/auth/drive'] 
 
-st.set_page_config(page_title="Piping Assistant AI", page_icon="🔧", layout="wide")
+st.set_page_config(page_title="Piping Agent Pro", page_icon="🔍", layout="wide")
 
-# --- ZONA LATERALĂ (Setup Proiect) ---
-with st.sidebar:
-    st.image("https://cdn-icons-png.flaticon.com/512/3093/3093466.png", width=50)
-    st.title("🎛️ Panou Proiect")
-    st.markdown("---")
+# --- 2. BACKEND FUNCTIONS ---
+
+def authenticate_drive():
+    if not os.path.exists(SERVICE_ACCOUNT_FILE): return None
+    try:
+        creds = service_account.Credentials.from_service_account_file(
+            SERVICE_ACCOUNT_FILE, scopes=SCOPES)
+        return build('drive', 'v3', credentials=creds)
+    except: return None
+
+# --- TOOL 1: LIBRARY SEARCH (Găsește fișierele) ---
+def tool_search_library(keyword: str):
+    """
+    SEARCHES the Google Drive Library for filenames matching the keyword.
+    USE THIS FIRST to check if a file exists (e.g., 'Do you have ASME B16.11?').
+    Returns a list of matching filenames.
+    """
+    print(f"--- TOOL: Searching Library for '{keyword}' ---")
+    service = authenticate_drive()
+    if not service: return "Error: Drive connection failed."
     
-    # Selector Proiect
-    proiect_activ = st.selectbox("Proiect Activ:", ["General", "Rafinărie Brazi", "Conductă Gaz"])
+    # Cautam recursiv in toate folderele (Drive face asta default)
+    q = f"name contains '{keyword}' and mimeType = 'application/pdf' and trashed=false"
+    try:
+        results = service.files().list(
+            q=q, 
+            pageSize=20, # Returnam primele 20 rezultate gasite
+            fields="files(id, name)"
+        ).execute()
+        
+        files = results.get('files', [])
+        if not files:
+            return f"No files found matching '{keyword}' in the library."
+        
+        file_list_str = "\n".join([f"- {f['name']}" for f in files])
+        return f"FOUND {len(files)} FILES matching '{keyword}':\n{file_list_str}\n\n(Ask me to READ one of these specifically.)"
+    except Exception as e:
+        return f"Search Error: {e}"
+
+# --- TOOL 2: DRIVE READER (Citește conținutul) ---
+def tool_read_document(exact_filename: str):
+    """
+    READS the content of a specific PDF file found by the search tool.
+    MANDATORY: Provide the exact filename from the search results.
+    """
+    print(f"--- TOOL: Reading content of '{exact_filename}' ---")
+    service = authenticate_drive()
+    if not service: return "Error: Drive connection failed."
     
-    st.info(f"Context: **{proiect_activ}**")
-    st.markdown("---")
+    q = f"name = '{exact_filename}' and mimeType = 'application/pdf' and trashed=false"
+    results = service.files().list(q=q, pageSize=1, fields="files(id, name)").execute()
+    files = results.get('files', [])
     
-    # UPLOAD PDF (Creierul Aplicației)
-    st.subheader("📄 Documentație Tehnică")
-    uploaded_file = st.file_uploader("Încarcă Caiet de Sarcini / Standard", type="pdf")
+    if not files:
+        # Fallback la contains daca numele nu e exact
+        q = f"name contains '{exact_filename}' and mimeType = 'application/pdf' and trashed=false"
+        results = service.files().list(q=q, pageSize=1, fields="files(id, name)").execute()
+        files = results.get('files', [])
+        
+    if not files: return "File not found."
     
-    # Procesarea PDF-ului
-    if uploaded_file is not None:
-        if "pdf_text" not in st.session_state:
-            st.session_state.pdf_text = ""
+    target = files[0]
+    try:
+        request = service.files().get_media(fileId=target['id'])
+        fh = io.BytesIO()
+        downloader = MediaIoBaseDownload(fh, request)
+        done = False
+        while not done: _, done = downloader.next_chunk()
+        
+        fh.seek(0)
+        reader = PdfReader(fh)
+        text = ""
+        for i, page in enumerate(reader.pages[:40]): # Limita 40 pagini
+            text += f"\n[DOC: {target['name']} | PAGE: {i+1}]\n{page.extract_text()}\n"
             
-        with st.spinner("Citesc documentul..."):
-            try:
-                reader = PdfReader(uploaded_file)
-                text = ""
-                for page in reader.pages:
-                    text += page.extract_text()
-                
-                # Salvăm textul în memorie
-                st.session_state.pdf_text = text
-                st.success(f"✅ Document încărcat! ({len(reader.pages)} pagini)")
-            except Exception as e:
-                st.error(f"Eroare la citire: {e}")
+        if "loaded_docs" not in st.session_state: st.session_state.loaded_docs = []
+        if target['name'] not in st.session_state.loaded_docs:
+            st.session_state.loaded_docs.append(target['name'])
+            
+        return f"SUCCESS. Content of '{target['name']}':\n{text[:100000]}"
+    except Exception as e:
+        return f"Read Error: {e}"
+
+# --- TOOL 3: WEB SEARCH ---
+def tool_search_web(query: str):
+    """Searches the internet (DuckDuckGo) for images/prices/info."""
+    try:
+        results = DDGS().text(query, max_results=5)
+        if not results: return "No web results."
+        summary = ""
+        for r in results:
+            summary += f"- {r['title']}: {r['href']}\n"
+        return summary
+    except Exception as e:
+        return f"Web Error: {e}"
+
+# --- UPLOAD FUNCTION ---
+def upload_to_drive(uploaded_file):
+    service = authenticate_drive()
+    if not service: return False, "Auth Error"
+    try:
+        q = "mimeType='application/vnd.google-apps.folder' and name='PIPING_LIBRARY' and trashed=false"
+        res = service.files().list(q=q, fields="files(id)").execute()
+        folders = res.get('files', [])
+        parent_id = folders[0]['id'] if folders else None
+        
+        file_metadata = {'name': uploaded_file.name}
+        if parent_id: file_metadata['parents'] = [parent_id]
+            
+        media = MediaIoBaseUpload(uploaded_file, mimetype='application/pdf')
+        service.files().create(body=file_metadata, media_body=media, fields='id').execute()
+        return True, "OK"
+    except Exception as e:
+        return False, str(e)
+
+# --- 3. AUTO-DETECT MODEL ---
+tools_list = [tool_search_library, tool_read_document, tool_search_web]
+
+def get_working_model():
+    try:
+        available = [m.name for m in genai.list_models() if 'generateContent' in m.supported_generation_methods]
+        for m in available: 
+            if "flash" in m and "1.5" in m: return m
+        for m in available: 
+            if "pro" in m and "1.5" in m: return m
+        if available: return available[0]
+    except: pass
+    return None
+
+valid_model_name = get_working_model()
+if not valid_model_name:
+    st.error("❌ No Gemini models found.")
+    st.stop()
+
+model = genai.GenerativeModel(valid_model_name, tools=tools_list)
+
+# --- 4. SESSION STATE ---
+if "messages" not in st.session_state: st.session_state.messages = []
+if "loaded_docs" not in st.session_state: st.session_state.loaded_docs = []
+if "chat_session" not in st.session_state: 
+    st.session_state.chat_session = model.start_chat(enable_automatic_function_calling=True)
+
+# --- 5. SIDEBAR ---
+with st.sidebar:
+    lottie_url = "https://lottie.host/5a837012-78d1-4389-9e8a-86695b77ce80/H5pZqg1XlI.json"
+    try:
+        r = requests.get(lottie_url)
+        if r.status_code == 200: st_lottie(r.json(), height=120, key="anim")
+    except: pass
+
+    st.title("🧠 Brain Center")
+    st.success(f"Engine: `{valid_model_name}`")
     
-    if st.button("🗑️ Șterge Memoria"):
-        st.session_state.pdf_text = ""
+    st.markdown("---")
+    st.subheader("📂 Active Docs")
+    if st.session_state.loaded_docs:
+        for d in st.session_state.loaded_docs: st.caption(f"✅ {d}")
+    else: st.caption("Memory empty.")
+    
+    st.markdown("---")
+    uploaded_file = st.file_uploader("Upload to Library", type=['pdf'])
+    if uploaded_file and st.button("💾 Save"):
+        with st.spinner("Uploading..."):
+            s, m = upload_to_drive(uploaded_file)
+            if s: st.success("Saved!"); time.sleep(1); st.rerun()
+            else: st.error(f"Error: {m}")
+            
+    if st.button("🗑️ Reset"):
         st.session_state.messages = []
+        st.session_state.loaded_docs = []
+        st.session_state.chat_session = model.start_chat(enable_automatic_function_calling=True)
         st.rerun()
 
-# --- ZONA PRINCIPALĂ ---
-st.title("🔧 Piping Assistant Pro")
+# --- 6. CHAT UI ---
+st.title("🔎 Piping Agent v13.1 (Deep Search)")
 
-if "pdf_text" in st.session_state and st.session_state.pdf_text:
-    st.caption(f"🧠 Memorie activă: Document încărcat pentru {proiect_activ}")
-else:
-    st.caption("⚠️ Niciun document încărcat. Răspund din cunoștințe generale.")
+for msg in st.session_state.messages:
+    with st.chat_message(msg["role"]):
+        st.markdown(msg["content"])
 
-# Istoric Chat
-if "messages" not in st.session_state:
-    st.session_state.messages = []
-
-for message in st.session_state.messages:
-    with st.chat_message(message["role"]):
-        st.markdown(message["content"])
-
-# Input Utilizator
-if prompt := st.chat_input("Întreabă ceva din documentul încărcat..."):
-    
-    with st.chat_message("user"):
-        st.markdown(prompt)
+if prompt := st.chat_input("Ex: 'Ai standardul ASME B16.11?' sau 'Ce scrie în el?'"):
+    with st.chat_message("user"): st.markdown(prompt)
     st.session_state.messages.append({"role": "user", "content": prompt})
 
     with st.chat_message("assistant"):
-        with st.spinner("Analizez specificațiile..."):
+        with st.spinner("Searching..."):
             try:
-                # Construim Prompt-ul FINAL (Context + Document + Întrebare)
-                # Aici e secretul: Îi dăm tot textul PDF-ului să îl "vadă"
-                pdf_context = st.session_state.get("pdf_text", "")
-                
-                final_prompt = (
-                    f"Ești un Expert Piping Engineer. \n"
-                    f"CONTEXT PROIECT: {proiect_activ}\n"
-                    f"DOCUMENTAȚIE ÎNCĂRCATĂ:\n {pdf_context[:500000]} \n" # Limită de siguranță, dar 2.5 duce mult mai mult
-                    f"--------------------------------\n"
-                    f"ÎNTREBAREA UTILIZATORULUI: {prompt}\n"
-                    f"Răspunde tehnic, citând secțiuni din document dacă este posibil."
+                system = (
+                    "You are an Expert Piping Engineer.\n"
+                    "TOOLS:\n"
+                    "1. `tool_search_library`: USE THIS FIRST whenever asking 'do you have this file?'. It searches the entire Drive.\n"
+                    "2. `tool_read_document`: Use this ONLY after finding the exact filename with search.\n"
+                    "3. `tool_search_web`: For external info.\n"
+                    "RULES:\n"
+                    "- Do NOT assume you know what files exist. Always use `tool_search_library`.\n"
+                    "- Answer in the user's language.\n"
                 )
-                
-                response = model.generate_content(final_prompt)
+                response = st.session_state.chat_session.send_message(f"{system}\n\nUSER: {prompt}")
                 st.markdown(response.text)
                 st.session_state.messages.append({"role": "assistant", "content": response.text})
-                
+                if len(st.session_state.loaded_docs) > 0: st.rerun()
             except Exception as e:
-                st.error(f"Eroare: {e}")
+                st.error(f"Error: {e}")
